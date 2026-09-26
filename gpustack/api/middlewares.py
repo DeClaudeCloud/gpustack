@@ -33,7 +33,6 @@ from gpustack.server.metrics_collector import (
 )
 from gpustack.api.types.openai_ext import CreateEmbeddingResponseExt, CompletionExt
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -280,6 +279,14 @@ async def record_model_usage(
         # without flooding the log on every request.
         _warn_about_missing_start_time()
         started_at = now
+    stream: bool = bool(getattr(request.state, "stream", False))
+    # ``first_token_time`` is stamped by ``process_chunk`` on the first
+    # streamed chunk, so it only exists for streams -- the same contract the
+    # gateway's ``ttft_ms`` follows.
+    ttft_ms = None
+    first_token_time = getattr(request.state, "first_token_time", None)
+    if stream and first_token_time is not None:
+        ttft_ms = max(int((first_token_time - started_at).total_seconds() * 1000), 0)
     metric = ModelUsageMetrics(
         model=model.name,
         input_token=prompt_tokens,
@@ -290,6 +297,11 @@ async def record_model_usage(
         completed=True,
         started_at=int(started_at.timestamp() * 1000),
         completed_at=int(now.timestamp() * 1000),
+        ttft_ms=ttft_ms,
+        # ModelUsageMiddleware only records responses that went out as 200.
+        status_code=200,
+        stream=stream,
+        user_agent=request.headers.get("user-agent"),
         user_id=user.id if user is not None else None,
         model_id=model.id,
         model_route_id=getattr(request.state, "model_route_id", None),

@@ -18,6 +18,9 @@ The tabs are:
 - **Storage** — storage capacity usage, broken down by storage / user.
 - **Resource Events** — the lifecycle audit log behind the compute/storage numbers.
 
+Individual inference requests are listed on the separate [Request Logs](#request-logs) page, next
+to `Usage` in the navigation.
+
 ## What gets metered
 
 | Resource          | Metered while…                                                                                   | Bucket granularity |
@@ -137,6 +140,48 @@ transition. Useful for explaining why a number looks the way it does.
 
 Filters: **date range**, **resource type** (GPU Instance / Storage), **event type**, and a fuzzy
 **resource name** search.
+
+## Request Logs
+
+![Request Logs](../assets/usage/usage-request-logs.png)
+
+One row per inference request, newest first — the per-request view behind the Tokens numbers. Open
+it from `Request Logs` in the navigation.
+
+- **Stats** — total requests, success rate, user success, average and p95 latency, output speed
+  (tokens per second after the first token) with the average time to first token, and total input
+  and output tokens. Each is compared with the equally long period right before the selected one.
+- **Request volume** — successful, failed and incomplete requests over time.
+- **Table** — time, type, status, request ID, model, duration, time to first token, output speed,
+  tokens, API key, user agent and (for Admins) user. Select a row, or its request ID, to see all of the
+  request's details, including the gateway request ID that the gateway returns to the caller in the
+  `X-GPUStack-Request-Id` response header.
+
+Filters: **time range** (the last 15 minutes up to the last 30 days, or a custom range), **search**
+by request ID, response ID or model, **status**, **model**, **API key**, **user** (Admins only) and
+**streaming**. Turn on **Live** to follow new requests as they finish; it is available for the
+relative time ranges.
+
+A request's status is one of:
+
+| Status     | Meaning                                                                                                                                            |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Success    | The model returned a response.                                                                                                                     |
+| Error      | The request failed, or the upstream returned no model response.                                                                                    |
+| Incomplete | The response ended before its token usage was reported — the client disconnected or the upstream stopped mid-response. Token counts are estimated. |
+
+**User success** counts a request that was retried on a fallback target once, as successful if any
+attempt succeeded; **success rate** counts every attempt.
+
+!!! note
+
+    Requests appear a few seconds after they finish. Requests the gateway rejects before they reach
+    a model — an invalid API key or an unknown model name — are not listed. Times on this page are
+    shown in your browser's timezone.
+
+    The user agent of a request served through the gateway is read from the embedded gateway's
+    access log, so it is shown when GPUStack runs its gateway embedded (the default for the
+    container image) and left empty with an in-cluster or external gateway.
 
 ## Timezone
 

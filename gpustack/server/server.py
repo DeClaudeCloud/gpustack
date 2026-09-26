@@ -89,6 +89,7 @@ from gpustack.server.sources.probe import SourceRefresher
 from gpustack.server.update_check import UpdateChecker
 from gpustack.server.worker_status_buffer import flush_worker_status_to_db
 from gpustack.server.metrics_collector import flush_gateway_metrics_to_db
+from gpustack.gateway.access_log import GatewayAccessLog, set_gateway_access_log
 from gpustack.server.usage_details_archiver import UsageDetailsArchiver
 from gpustack.server.resource_event_logger import ResourceEventLogger
 from gpustack.server.resource_usage_collector import ResourceUsageCollector
@@ -322,6 +323,7 @@ class Server:
         # These tasks can run on all instances
         self._start_worker_status_flusher()
         self._start_gateway_metrics_flusher()
+        self._start_gateway_access_log_follower()
         self._start_metrics_exporter()
         self._start_query_count_logger()
         self._start_default_registry_checker()
@@ -583,6 +585,22 @@ class Server:
         self._create_async_task(flush_gateway_metrics_to_db())
 
         logger.debug("Gateway metrics flusher started.")
+
+    def _start_gateway_access_log_follower(self):
+        # The gateway's usage report carries no User-Agent; the embedded
+        # gateway's access log does. Only ``embedded`` writes that log where
+        # this process can read it (see pack/rootfs/etc/s6-overlay/s6-rc.d/
+        # gateway/run), so in other modes gateway rows keep whatever user agent
+        # the report itself carried.
+        if self._config.gateway_mode != GatewayModeEnum.embedded:
+            return
+        access_log = GatewayAccessLog(
+            os.path.join(self._config.log_dir, "higress", "access.log")
+        )
+        set_gateway_access_log(access_log)
+        self._create_async_task(access_log.run())
+
+        logger.debug("Gateway access log follower started.")
 
     def _start_worker_instance_cleaner(self):
         worker_instance_cleaner = WorkerInstanceCleaner()

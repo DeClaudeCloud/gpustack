@@ -40,6 +40,7 @@ from gpustack.routes import (
     workers,
     usage,
     resource_usage,
+    request_logs,
     cloud_credentials,
     worker_pools,
     clusters,
@@ -116,6 +117,7 @@ v1_base_router.include_router(users.directory_router, tags=["Users"])
 v1_base_router.include_router(api_keys.router, prefix="/api-keys", tags=["API Keys"])
 v1_base_router.include_router(usage.router, prefix="/usage", tags=["Usage"])
 v1_base_router.include_router(resource_usage.router, prefix="/usage", tags=["Usage"])
+v1_base_router.include_router(request_logs.router, prefix="/usage", tags=["Usage"])
 v1_base_router.include_router(
     me_orgs.router,
     prefix="/users/me",

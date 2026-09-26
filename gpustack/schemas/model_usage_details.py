@@ -2,7 +2,7 @@ from datetime import date, datetime
 from typing import ClassVar, Optional
 
 from pydantic import ConfigDict
-from sqlalchemy import BigInteger, Boolean, Column, Integer, false
+from sqlalchemy import BigInteger, Boolean, Column, Index, Integer, false
 from sqlmodel import Field, SQLModel
 
 from gpustack.mixins import BaseModelMixin
@@ -36,6 +36,12 @@ class ModelUsageDetails(SQLModel, BaseModelMixin, table=True):
     """
 
     __tablename__: ClassVar[str] = "model_usage_details"
+    __table_args__ = (
+        # The request log filters, buckets and tails on ``created_at`` (the
+        # request's completion wall-clock). Hot table only; the archive is
+        # not read by it.
+        Index("ix_model_usage_details_created_at", "created_at"),
+    )
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: Optional[int] = Field(default=None, sa_column=Column(Integer))
     user_name: Optional[str] = Field(default=None)
@@ -122,6 +128,20 @@ class ModelUsageDetails(SQLModel, BaseModelMixin, table=True):
     # mints none, when the endpoint returns no JSON at all (TTS, image), and
     # when no response arrived.
     upstream_response_id: Optional[str] = Field(default=None)
+    # HTTP status the caller received, and whether it asked for a stream.
+    # Both are NULL when the reporter did not carry them -- the gateway
+    # token-usage plugin does not yet -- and NULL means "not reported", not
+    # "succeeded" / "not streamed". The request-log read side derives an
+    # outcome and a stream flag from the other columns in that case (see
+    # ``gpustack.routes.request_logs``) instead of this column being
+    # backfilled with a guess.
+    status_code: Optional[int] = Field(default=None, sa_column=Column(Integer))
+    stream: Optional[bool] = Field(default=None, sa_column=Column(Boolean))
+    # The caller's User-Agent, at most 255 characters. Reported by the direct
+    # inference path; for gateway traffic, taken from the gateway report when
+    # it carries one, else from the embedded gateway's access log (see
+    # ``gpustack.gateway.access_log``). NULL when none of those had it.
+    user_agent: Optional[str] = Field(default=None)
 
     model_config = ConfigDict(protected_namespaces=())
 
@@ -196,5 +216,8 @@ class ModelUsageDetailsArchive(SQLModel, BaseModelMixin, table=True):
     # that only worked before archival would be the wrong half of the feature.
     request_id: Optional[str] = Field(default=None, index=True)
     upstream_response_id: Optional[str] = Field(default=None)
+    status_code: Optional[int] = Field(default=None, sa_column=Column(Integer))
+    stream: Optional[bool] = Field(default=None, sa_column=Column(Boolean))
+    user_agent: Optional[str] = Field(default=None)
 
     model_config = ConfigDict(protected_namespaces=())

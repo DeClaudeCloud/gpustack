@@ -14,6 +14,10 @@ from gpustack.schemas.clusters import Cluster
 from gpustack.schemas.model_provider import ModelProvider
 from gpustack.schemas.model_routes import ModelRoute
 from gpustack.schemas.model_usage import ModelUsage, OperationEnum
+from gpustack.gateway.access_log import (
+    get_gateway_access_log,
+    normalize_user_agent,
+)
 from gpustack.schemas.model_usage_details import ModelUsageDetails
 from gpustack.schemas.models import Model, is_embedding_model, is_reranker_model
 from gpustack.schemas.principals import (
@@ -89,6 +93,15 @@ class ModelUsageMetrics(BaseModel):
     # The model's own id for the response (``chatcmpl-…`` / ``resp_…`` /
     # ``msg_…``), taken verbatim from the upstream body.
     upstream_response_id: Optional[str] = None
+    # HTTP status the caller received and whether it asked for a stream.
+    # Optional so a reporter that doesn't know them (the token-usage plugin
+    # up to at least 0.4.0) keeps working; stored as reported, NULL when
+    # absent. Out-of-range status values are dropped rather than stored.
+    status_code: Optional[int] = None
+    stream: Optional[bool] = None
+    # The caller's User-Agent. The direct path reports it; for gateway
+    # reports without one, the embedded gateway's access log supplies it.
+    user_agent: Optional[str] = None
     user_id: Optional[int] = None
     model_id: Optional[int] = None
     model_route_id: Optional[int] = None
@@ -192,6 +205,18 @@ def _unixmilli_to_naive_utc(ms: Optional[int]) -> Optional[datetime]:
 # Resolved once at import time; tests monkeypatch this attribute to pin a
 # deterministic timezone independent of the host's ``TZ``.
 _ROLLUP_TZ: tzinfo = resolve_rollup_tz()
+
+
+def _bounded_status_code(value: Optional[int]) -> Optional[int]:
+    """An HTTP status as reported, or ``None`` when it can't be one.
+
+    Envoy logs ``0`` for a request that never got a response (the client
+    left first); that is "no status", not a status, so it is stored as NULL
+    along with anything else outside the 100-599 range.
+    """
+    if value is None or not 100 <= value <= 599:
+        return None
+    return value
 
 
 def _resolve_metric_datetime(
@@ -843,6 +868,10 @@ async def store_usage_metrics(
                     session, model_usage, auto_commit=False
                 )
 
+            access_log = get_gateway_access_log()
+            # Gateway rows whose access-log line had not been read yet; the
+            # access-log follower fills them in once it is (after commit).
+            awaiting_user_agent: List[str] = []
             for metric in detail_metrics:
                 if not _validate_usage_metric(
                     metric,
@@ -879,6 +908,12 @@ async def store_usage_metrics(
                 metric_date, metric_dt = _resolve_metric_datetime(metric)
                 started_dt = _unixmilli_to_naive_utc(metric.started_at)
                 completed_dt = _unixmilli_to_naive_utc(metric.completed_at)
+                request_id = _bounded_reported_id(metric.request_id, "request_id")
+                user_agent = normalize_user_agent(metric.user_agent)
+                if user_agent is None and access_log is not None and request_id:
+                    user_agent = access_log.user_agent_for(request_id)
+                    if user_agent is None:
+                        awaiting_user_agent.append(request_id)
                 session.add(
                     ModelUsageDetails(
                         date=metric_date,
@@ -905,12 +940,13 @@ async def store_usage_metrics(
                         # check it against, so the only handling is the range
                         # bounds below.
                         ttft_ms=_bounded_ttft_ms(metric.ttft_ms),
-                        request_id=_bounded_reported_id(
-                            metric.request_id, "request_id"
-                        ),
+                        request_id=request_id,
                         upstream_response_id=_bounded_reported_id(
                             metric.upstream_response_id, "upstream_response_id"
                         ),
+                        status_code=_bounded_status_code(metric.status_code),
+                        stream=metric.stream,
+                        user_agent=user_agent,
                         # Audit timestamps still pinned to the request's
                         # wall-clock so the row's lifecycle stamps don't
                         # drift by the flush interval.
@@ -921,6 +957,8 @@ async def store_usage_metrics(
                 )
 
             await session.commit()
+            if awaiting_user_agent:
+                access_log.defer(awaiting_user_agent)
         except Exception as e:
             logger.exception(f"Error storing gateway metrics: {e}")
             await session.rollback()

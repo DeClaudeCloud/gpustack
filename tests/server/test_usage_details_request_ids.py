@@ -235,3 +235,83 @@ async def test_the_daily_rollup_does_not_carry_them(session):
     assert len((await session.exec(select(ModelUsage))).all()) == 1
     rollup_columns = {c.name for c in ModelUsage.__table__.columns}
     assert not rollup_columns & {"ttft_ms", "request_id", "upstream_response_id"}
+
+
+@pytest.mark.asyncio
+async def test_reported_status_and_stream_land_on_the_audit_row(session):
+    await store_usage_metrics(
+        [],
+        [
+            _metric(status_code=429, stream=True, request_id="a"),
+            _metric(request_id="b"),
+        ],
+    )
+
+    rows = {row.request_id: row for row in await _details(session)}
+    assert (rows["a"].status_code, rows["a"].stream) == (429, True)
+    # Absent means "not reported", so it stays NULL rather than defaulting to
+    # a value that would read as a real 200 / non-stream.
+    assert (rows["b"].status_code, rows["b"].stream) == (None, None)
+
+
+@pytest.mark.parametrize(
+    "reported, stored", [(0, None), (99, None), (600, None), (100, 100), (599, 599)]
+)
+@pytest.mark.asyncio
+async def test_a_status_outside_the_http_range_is_stored_as_absent(
+    session, reported, stored
+):
+    """Envoy logs ``0`` for a request that never got a response; that is no
+    status at all, not one the request log should show."""
+    await store_usage_metrics([], [_metric(status_code=reported)])
+
+    (row,) = await _details(session)
+    assert row.status_code == stored
+
+
+@pytest.mark.asyncio
+async def test_a_reported_user_agent_is_stored_bounded(session):
+    await store_usage_metrics(
+        [],
+        [
+            _metric(user_agent="openai-python/1.51.0", request_id="a"),
+            _metric(user_agent="x" * 300, request_id="b"),
+            _metric(user_agent="-", request_id="c"),
+        ],
+    )
+
+    rows = {row.request_id: row.user_agent for row in await _details(session)}
+    assert rows == {"a": "openai-python/1.51.0", "b": "x" * 255, "c": None}
+
+
+@pytest.mark.asyncio
+async def test_a_gateway_row_takes_its_user_agent_from_the_access_log(
+    session, monkeypatch, tmp_path
+):
+    """The gateway report carries no user agent; the embedded gateway's access
+    log does. A row whose log line has not been read yet is deferred, so the
+    follower can fill it in once it is."""
+    from gpustack.gateway.access_log import GatewayAccessLog
+
+    access_log = GatewayAccessLog(str(tmp_path / "access.log"))
+    access_log.ingest_line('{"request_id": "seen", "user_agent": "curl/8.5.0"}')
+    monkeypatch.setattr(
+        "gpustack.server.metrics_collector.get_gateway_access_log", lambda: access_log
+    )
+
+    await store_usage_metrics(
+        [],
+        [
+            _metric(request_id="seen"),
+            _metric(request_id="not-yet"),
+            _metric(request_id="reported", user_agent="httpx/0.27"),
+        ],
+    )
+
+    rows = {row.request_id: row.user_agent for row in await _details(session)}
+    assert rows == {"seen": "curl/8.5.0", "not-yet": None, "reported": "httpx/0.27"}
+
+    access_log.ingest_line(
+        '{"request_id": "not-yet", "user_agent": "Go-http-client/2.0"}'
+    )
+    assert access_log.take_resolved() == {"not-yet": "Go-http-client/2.0"}
