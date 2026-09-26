@@ -1,0 +1,149 @@
+# Fork-only automation. It lives in its own commit on top of the feature
+# branch and is not part of anything proposed upstream.
+#
+# Every day:
+#   1. keep upstream's own workflows disabled in this fork (they build and
+#      publish images and would run on every mirrored push),
+#   2. mirror upstream's main into this fork's main,
+#   3. rebase the feature branch onto it, re-parenting the fork's Alembic
+#      revision if upstream added one in the meantime,
+#   4. run upstream's PR check (`make ci`), and only then force-push.
+#
+# A successful run triggers .github/workflows/fork-image.yml.
+#
+# Pushing upstream commits that touch .github/workflows needs a token with the
+# "workflows" permission, which the built-in GITHUB_TOKEN never has. Add a
+# fine-grained token (this repository; Contents and Workflows: read and write)
+# as the SYNC_TOKEN secret; without it the sync works until upstream next
+# changes a workflow file, and then fails with a message saying so.
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: gpustack/gpustack
+  UPSTREAM_BRANCH: main
+  FEATURE_BRANCH: feat/request-logs
+  # Alembic revisions this fork adds on top of upstream's chain.
+  FORK_MIGRATIONS: e192906f1eae 6d4092d2e980
+  SELF: .github/workflows/sync-upstream.yml
+  # The fork's own workflows; every other workflow is upstream's and stays off.
+  FORK_WORKFLOWS: .github/workflows/sync-upstream.yml .github/workflows/fork-image.yml
+
+jobs:
+  sync:
+    if: github.repository != 'gpustack/gpustack'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Keep upstream workflows disabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow list --all --repo "$GITHUB_REPOSITORY" --json id,path,state \
+            --jq '.[] | select(.state == "active") | "\(.id) \(.path)"' |
+          while read -r id path; do
+            case " $FORK_WORKFLOWS " in *" $path "*) continue ;; esac
+            echo "$id"
+          done |
+          while read -r id; do
+            gh workflow disable "$id" --repo "$GITHUB_REPOSITORY"
+            echo "disabled workflow $id"
+          done
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FEATURE_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Fetch upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          echo "BEFORE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "UPSTREAM_SHA=$(git rev-parse "upstream/$UPSTREAM_BRANCH")" >> "$GITHUB_ENV"
+
+      - name: Mirror upstream main
+        run: |
+          if ! git push --force origin "refs/remotes/upstream/$UPSTREAM_BRANCH:refs/heads/$UPSTREAM_BRANCH" 2> push.err; then
+            cat push.err >&2
+            if grep -q "workflow" push.err; then
+              echo "::error::Upstream changed a workflow file; pushing it needs the SYNC_TOKEN secret (see the top of $SELF)."
+            fi
+            exit 1
+          fi
+          echo "Mirrored \`$UPSTREAM_BRANCH\` at \`${UPSTREAM_SHA:0:10}\`." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Rebase feature branch
+        id: rebase
+        run: |
+          if git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" HEAD; then
+            echo "\`$FEATURE_BRANCH\` already sits on upstream \`$UPSTREAM_BRANCH\`." >> "$GITHUB_STEP_SUMMARY"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git rebase "upstream/$UPSTREAM_BRANCH"; then
+            conflicts=$(git diff --name-only --diff-filter=U | sed 's/^/- /')
+            git rebase --abort
+            {
+              echo "### Rebase conflict"
+              echo "\`$FEATURE_BRANCH\` no longer applies cleanly on upstream \`${UPSTREAM_SHA:0:10}\` and was left unchanged. Conflicting files:"
+              echo "$conflicts"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Rebase conflict; resolve it locally and force-push $FEATURE_BRANCH."
+            exit 1
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Re-parent fork migrations
+        if: steps.rebase.outputs.changed == 'true'
+        run: |
+          # FORK_MIGRATIONS is a space-separated list; split it on purpose.
+          # shellcheck disable=SC2086
+          changed=$(python3 .github/fork/repoint_migration.py $FORK_MIGRATIONS)
+          if [ -n "$changed" ]; then
+            # Fold the fix into the commit that added the revision, so the
+            # feature commit stays self-contained.
+            target=$(git log --format=%H --diff-filter=A -1 -- "$changed")
+            git add "$changed"
+            git commit --fixup="$target"
+            GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash "upstream/$UPSTREAM_BRANCH"
+            echo "Re-parented \`$changed\` onto upstream's new head." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.rebase.outputs.changed == 'true'
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        if: steps.rebase.outputs.changed == 'true'
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-3.12-${{ hashFiles('**/uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-3.12-
+
+      # Upstream's PR check, verbatim: install, deps, lint, test, build.
+      - name: make ci
+        if: steps.rebase.outputs.changed == 'true'
+        run: make ci
+
+      - name: Push feature branch
+        if: steps.rebase.outputs.changed == 'true'
+        run: |
+          git push --force-with-lease="$FEATURE_BRANCH:$BEFORE" origin "HEAD:refs/heads/$FEATURE_BRANCH"
+          echo "Rebased \`$FEATURE_BRANCH\` onto upstream \`${UPSTREAM_SHA:0:10}\` (was \`${BEFORE:0:10}\`)." >> "$GITHUB_STEP_SUMMARY"

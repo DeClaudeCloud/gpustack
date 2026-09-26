@@ -1,0 +1,252 @@
+# Fork-only: build this fork's GPUStack image and publish it to GHCR.
+#
+#   ghcr.io/<owner>/gpustack:dev          newest build of the default branch
+#   ghcr.io/<owner>/gpustack:dev-<sha7>   one per commit
+#
+# The image is built exactly the way upstream's pack.yaml builds
+# gpustack/gpustack:dev -- same pack/Dockerfile, same build arguments,
+# starting from upstream's public build cache -- with one difference: the UI
+# is built from this fork's UI repository and handed to the build with
+# UI_DOWNLOAD=false, instead of being downloaded from upstream's UI release
+# bucket.
+#
+# Builds run after each successful upstream sync, on pushes to the default
+# branch, and daily (which picks up UI fork changes). A build is skipped when
+# the backend and UI commits match what the published image was built from.
+name: Fork image
+
+on:
+  push:
+    branches: [feat/request-logs]
+  workflow_run:
+    workflows: ["Sync upstream"]
+    types: [completed]
+  schedule:
+    - cron: "40 4 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even when nothing changed
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: fork-image
+  cancel-in-progress: false
+
+env:
+  UI_REPO: ${{ github.repository_owner }}/gpustack-ui
+  BRANCH: feat/request-logs
+  PYTHON_VERSION: "3.11"
+  INPUTS_LABEL: io.github.gpustack-fork.inputs
+
+jobs:
+  plan:
+    if: >-
+      github.repository != 'gpustack/gpustack' &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      image: ${{ steps.plan.outputs.image }}
+      backend_sha: ${{ steps.plan.outputs.backend_sha }}
+      ui_sha: ${{ steps.plan.outputs.ui_sha }}
+      inputs: ${{ steps.plan.outputs.inputs }}
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Resolve inputs
+        id: plan
+        env:
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          image="ghcr.io/$owner/gpustack"
+          backend_sha=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY" "refs/heads/$BRANCH" | cut -f1)
+          ui_sha=$(git ls-remote "https://github.com/$UI_REPO" "refs/heads/$BRANCH" | cut -f1)
+          for v in backend_sha ui_sha; do
+            [ -n "${!v}" ] || { echo "::error::could not resolve $v"; exit 1; }
+          done
+          inputs="backend=$backend_sha ui=$ui_sha"
+          published=$(docker buildx imagetools inspect "$image:dev" --format '{{json .Image}}' 2>/dev/null |
+            jq -r --arg l "$INPUTS_LABEL" '.config.Labels[$l] // empty' || true)
+          build=true
+          if [ "$published" = "$inputs" ] && [ "$FORCE" != true ]; then
+            build=false
+            echo "\`$image:dev\` is already built from these commits; nothing to do." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          {
+            echo "build=$build"
+            echo "image=$image"
+            echo "backend_sha=$backend_sha"
+            echo "ui_sha=$ui_sha"
+            echo "inputs=$inputs"
+          } >> "$GITHUB_OUTPUT"
+
+  # A push is a hand-made change (e.g. a resolved rebase conflict) that the
+  # sync job has not verified; hold it to upstream's own PR check first.
+  test:
+    needs: plan
+    if: needs.plan.outputs.build == 'true' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.backend_sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-3.12-${{ hashFiles('**/uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-3.12-
+      # Upstream's PR check, verbatim: install, deps, lint, test, build.
+      - name: make ci
+        run: make ci
+
+  ui:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UI_REPO }}
+          ref: ${{ needs.plan.outputs.ui_sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build
+        env:
+          GPUSTACK_UI_COMMIT_ID: ${{ needs.plan.outputs.ui_sha }}
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: dist/
+          retention-days: 3
+
+  build:
+    needs: [plan, test, ui]
+    if: >-
+      always() && needs.plan.outputs.build == 'true' && needs.ui.result == 'success' &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.backend_sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      # Same space preparation upstream's pack.yaml uses for this Dockerfile.
+      - name: Maximize Docker Build Space
+        uses: gpustack/.github/.github/actions/maximize-docker-build-space@main
+        with:
+          deep-clean: true
+          root-reserve-mb: 20480
+
+      # hack/install.sh packages whatever is in gpustack/ui when
+      # UI_DOWNLOAD=false, adding upstream's extra static files and the Helm
+      # chart on top, exactly as it does for a downloaded release.
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: gpustack/ui
+
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+            env.BUILDKIT_STEP_LOG_MAX_SIZE=-1
+            env.BUILDKIT_STEP_LOG_MAX_SPEED=-1
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Metadata
+        id: meta
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+          BACKEND_SHA: ${{ needs.plan.outputs.backend_sha }}
+        run: |
+          source="https://github.com/$GITHUB_REPOSITORY"
+          created=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          {
+            echo "tags<<EOF"
+            echo "$IMAGE:dev"
+            echo "$IMAGE:dev-${BACKEND_SHA:0:7}"
+            echo "EOF"
+            echo "source=$source"
+            echo "created=$created"
+            # Same shape pack.yaml passes: the labels a mirrored runtime
+            # deployment uses to find images built alongside this one.
+            echo "filter_labels=org.opencontainers.image.source=$source;org.opencontainers.image.version=dev;org.opencontainers.image.revision=$BACKEND_SHA;org.opencontainers.image.created=$created;"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          file: pack/Dockerfile
+          context: .
+          platforms: linux/amd64
+          ulimit: |
+            nofile=65536:65536
+          shm-size: 16G
+          provenance: false
+          push: true
+          # GIT_COMMIT: pack/Dockerfile stamps the offline docs with it and
+          # fails the build without it (upstream's pack.yaml passes it too).
+          build-args: |
+            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+            UI_DOWNLOAD=false
+            GIT_COMMIT=${{ needs.plan.outputs.backend_sha }}
+            GPUSTACK_RUNTIME_DOCKER_MIRRORED_NAME_FILTER_LABELS=${{ steps.meta.outputs.filter_labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ steps.meta.outputs.source }}
+            org.opencontainers.image.version=dev
+            org.opencontainers.image.revision=${{ needs.plan.outputs.backend_sha }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.created }}
+            org.opencontainers.image.title=gpustack
+            org.opencontainers.image.description=GPUStack built from ${{ github.repository }} (${{ env.BRANCH }})
+            ${{ env.INPUTS_LABEL }}=${{ needs.plan.outputs.inputs }}
+          # Upstream's public build cache: every layer before the GPUStack
+          # install step is identical, and every layer from it on depends on
+          # this branch's source, so a cache of our own would add nothing.
+          cache-from: type=registry,ref=gpustack/build-cache:gpustack-main-amd64
+
+      - name: Summary
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+          BACKEND_SHA: ${{ needs.plan.outputs.backend_sha }}
+          UI_SHA: ${{ needs.plan.outputs.ui_sha }}
+        run: |
+          {
+            echo "Published \`$IMAGE:dev\` and \`$IMAGE:dev-${BACKEND_SHA:0:7}\`."
+            echo
+            echo "| input | commit |"
+            echo "|---|---|"
+            echo "| backend (\`$GITHUB_REPOSITORY\`) | \`${BACKEND_SHA:0:10}\` |"
+            echo "| UI (\`$UI_REPO\`) | \`${UI_SHA:0:10}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
