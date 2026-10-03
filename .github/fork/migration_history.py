@@ -5,6 +5,7 @@ import ast
 import hashlib
 import json
 from pathlib import Path
+from typing import Optional
 
 VERSIONS = Path("gpustack/migrations/versions")
 APPROVALS = Path(".github/fork/migration_repairs.json")
@@ -139,7 +140,7 @@ def check_history(previous: dict, current: dict, repairs: dict) -> None:
             raise ValueError(f"Repair for {revision} needs a review reason")
 
 
-def merge_heads(directory: Path) -> Path:
+def merge_heads(directory: Path) -> Optional[Path]:
     """Add a merge revision without editing any existing revision."""
     revisions = read_revisions(directory)
     parents = heads(revisions)

@@ -20,6 +20,7 @@ def docker(*args, capture=False, check=True):
         check=check,
         text=True,
         stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if not check else None,
         timeout=600,
     )
 
@@ -29,6 +30,8 @@ def probe(image: str, action: str, network: str, database: str = "fresh") -> str
     return docker(
         "run",
         "--rm",
+        "--name",
+        f"{network}-probe",
         "--network",
         network,
         "--mount",
@@ -128,6 +131,9 @@ def verify_images(candidate: str, previous: list, postgres_image: str) -> None:
                 compare_schemas(expected, actual)
                 print(f"Upgrade passed: {image}", flush=True)
     finally:
+        docker(
+            "rm", "--force", "--volumes", f"{network}-probe", capture=True, check=False
+        )
         docker("rm", "--force", "--volumes", container, capture=True, check=False)
         docker("network", "rm", network, capture=True, check=False)
 
