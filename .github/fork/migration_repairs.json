@@ -1,0 +1,12 @@
+{
+  "367a3982fcde": {
+    "fingerprint": "773d621d93b4f3948f86b56dcdc7f65cd2dda621f1dc18bb18eb6ee0a2b54c50",
+    "repair_revision": "82f0e1b6a943",
+    "reason": "Add deployment revision history for existing dev databases."
+  },
+  "d5e8f0a1b2c3": {
+    "fingerprint": "ebe39266bb5ebb15c5f96d36233a584413a09f8511054090e705dd9fcb080046",
+    "repair_revision": "82f0e1b6a943",
+    "reason": "Add computed resource claims for existing cache service instances."
+  }
+}

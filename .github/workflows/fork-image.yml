@@ -43,6 +43,8 @@ env:
   BRANCH: feat/request-logs
   PYTHON_VERSION: "3.11"
   INPUTS_LABEL: io.github.gpustack-fork.inputs
+  # September 29 image, also retained by :dev-95a314d.
+  CANARY_DIGEST: sha256:a29015d261d801136c62d0217798c0c94bb1e9ed75cda03c3ed785b3001cfd2d
 
 jobs:
   plan:
@@ -56,6 +58,7 @@ jobs:
       backend_sha: ${{ steps.plan.outputs.backend_sha }}
       ui_sha: ${{ steps.plan.outputs.ui_sha }}
       inputs: ${{ steps.plan.outputs.inputs }}
+      previous_image: ${{ steps.plan.outputs.previous_image }}
     steps:
       - uses: docker/login-action@v3
         with:
@@ -76,8 +79,11 @@ jobs:
             [ -n "${!v}" ] || { echo "::error::could not resolve $v"; exit 1; }
           done
           inputs="backend=$backend_sha ui=$ui_sha"
-          published=$(docker buildx imagetools inspect "$image:dev" --format '{{json .Image}}' 2>/dev/null |
-            jq -r --arg l "$INPUTS_LABEL" '.config.Labels[$l] // empty' || true)
+          previous_digest=$(docker buildx imagetools inspect "$image:dev" --format '{{.Manifest.Digest}}')
+          [[ "$previous_digest" == sha256:* ]] || { echo "::error::Cannot pin the previous image"; exit 1; }
+          previous_image="$image@$previous_digest"
+          published=$(docker buildx imagetools inspect "$previous_image" --format '{{json .Image}}' |
+            jq -r --arg l "$INPUTS_LABEL" '.config.Labels[$l] // empty')
           build=true
           if [ "$published" = "$inputs" ] && [ "$FORCE" != true ]; then
             build=false
@@ -89,6 +95,7 @@ jobs:
             echo "backend_sha=$backend_sha"
             echo "ui_sha=$ui_sha"
             echo "inputs=$inputs"
+            echo "previous_image=$previous_image"
           } >> "$GITHUB_OUTPUT"
 
   # A push is a hand-made change (e.g. a resolved rebase conflict) that the
@@ -204,7 +211,7 @@ jobs:
             echo "filter_labels=org.opencontainers.image.source=$source;org.opencontainers.image.version=dev;org.opencontainers.image.revision=$BACKEND_SHA;org.opencontainers.image.created=$created;"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
+      - name: Build candidate
         uses: docker/build-push-action@v6
         with:
           file: pack/Dockerfile
@@ -214,7 +221,8 @@ jobs:
             nofile=65536:65536
           shm-size: 16G
           provenance: false
-          push: true
+          push: false
+          load: true
           # GIT_COMMIT: pack/Dockerfile stamps the offline docs with it and
           # fails the build without it (upstream's pack.yaml passes it too).
           build-args: |
@@ -235,6 +243,30 @@ jobs:
           # install step is identical, and every layer from it on depends on
           # this branch's source, so a cache of our own would add nothing.
           cache-from: type=registry,ref=gpustack/build-cache:gpustack-main-amd64
+
+      - name: Verify database upgrades before publication
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+          PREVIOUS_IMAGE: ${{ needs.plan.outputs.previous_image }}
+        run: |
+          python3 .github/fork/verify_image_upgrade.py \
+            --candidate "$IMAGE:dev" \
+            --previous "$PREVIOUS_IMAGE" \
+            --previous "$IMAGE@$CANARY_DIGEST"
+
+      - name: Publish verified candidate
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+          BACKEND_SHA: ${{ needs.plan.outputs.backend_sha }}
+          PREVIOUS_IMAGE: ${{ needs.plan.outputs.previous_image }}
+        run: |
+          current_digest=$(docker buildx imagetools inspect "$IMAGE:dev" --format '{{.Manifest.Digest}}')
+          if [ "$IMAGE@$current_digest" != "$PREVIOUS_IMAGE" ]; then
+            echo "::error::The published baseline changed during verification; rerun the workflow."
+            exit 1
+          fi
+          docker push "$IMAGE:dev-${BACKEND_SHA:0:7}"
+          docker push "$IMAGE:dev"
 
       - name: Summary
         env:

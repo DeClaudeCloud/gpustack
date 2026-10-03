@@ -5,9 +5,8 @@
 #   1. keep upstream's own workflows disabled in this fork (they build and
 #      publish images and would run on every mirrored push),
 #   2. mirror upstream's main into this fork's main,
-#   3. rebase the feature branch onto it, re-parenting the fork's Alembic
-#      revision if upstream added one in the meantime,
-#   4. run upstream's PR check (`make ci`), and only then force-push.
+#   3. merge upstream, preserving published migrations and merging new heads,
+#   4. check migration history and run `make ci`, then fast-forward push.
 #
 # A successful run triggers .github/workflows/fork-image.yml.
 #
@@ -35,8 +34,6 @@ env:
   UPSTREAM_REPO: gpustack/gpustack
   UPSTREAM_BRANCH: main
   FEATURE_BRANCH: feat/request-logs
-  # Alembic revisions this fork adds on top of upstream's chain.
-  FORK_MIGRATIONS: e192906f1eae 6d4092d2e980
   SELF: .github/workflows/sync-upstream.yml
   # The fork's own workflows; every other workflow is upstream's and stays off.
   FORK_WORKFLOWS: .github/workflows/sync-upstream.yml .github/workflows/fork-image.yml
@@ -88,49 +85,48 @@ jobs:
           fi
           echo "Mirrored \`$UPSTREAM_BRANCH\` at \`${UPSTREAM_SHA:0:10}\`." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Rebase feature branch
-        id: rebase
+      - name: Merge upstream
+        id: sync
         run: |
           if git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" HEAD; then
-            echo "\`$FEATURE_BRANCH\` already sits on upstream \`$UPSTREAM_BRANCH\`." >> "$GITHUB_STEP_SUMMARY"
+            echo "\`$FEATURE_BRANCH\` already includes upstream \`$UPSTREAM_BRANCH\`." >> "$GITHUB_STEP_SUMMARY"
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if ! git rebase "upstream/$UPSTREAM_BRANCH"; then
+          baseline="$RUNNER_TEMP/migration-baseline"
+          mkdir -p "$baseline"
+          git archive "$BEFORE" gpustack/migrations/versions | tar -x -C "$baseline"
+          echo "MIGRATION_BASELINE=$baseline/gpustack/migrations/versions" >> "$GITHUB_ENV"
+          if ! git merge --no-edit "upstream/$UPSTREAM_BRANCH"; then
             conflicts=$(git diff --name-only --diff-filter=U | sed 's/^/- /')
-            git rebase --abort
+            git merge --abort
             {
-              echo "### Rebase conflict"
-              echo "\`$FEATURE_BRANCH\` no longer applies cleanly on upstream \`${UPSTREAM_SHA:0:10}\` and was left unchanged. Conflicting files:"
+              echo "### Merge conflict"
+              echo "\`$FEATURE_BRANCH\` could not merge upstream \`${UPSTREAM_SHA:0:10}\` and was left unchanged. Conflicting files:"
               echo "$conflicts"
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::Rebase conflict; resolve it locally and force-push $FEATURE_BRANCH."
+            echo "::error::Merge conflict; resolve it locally and push $FEATURE_BRANCH."
             exit 1
           fi
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
-      - name: Re-parent fork migrations
-        if: steps.rebase.outputs.changed == 'true'
+      - name: Merge migration heads and check history
+        if: steps.sync.outputs.changed == 'true'
         run: |
-          # FORK_MIGRATIONS is a space-separated list; split it on purpose.
-          # shellcheck disable=SC2086
-          changed=$(python3 .github/fork/repoint_migration.py $FORK_MIGRATIONS)
+          changed=$(python3 .github/fork/migration_history.py merge)
           if [ -n "$changed" ]; then
-            # Fold the fix into the commit that added the revision, so the
-            # feature commit stays self-contained.
-            target=$(git log --format=%H --diff-filter=A -1 -- "$changed")
             git add "$changed"
-            git commit --fixup="$target"
-            GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash "upstream/$UPSTREAM_BRANCH"
-            echo "Re-parented \`$changed\` onto upstream's new head." >> "$GITHUB_STEP_SUMMARY"
+            git commit -m "ci(fork): merge upstream and fork migration heads"
+            echo "Added migration merge \`$changed\`." >> "$GITHUB_STEP_SUMMARY"
           fi
+          python3 .github/fork/migration_history.py check --previous-dir "$MIGRATION_BASELINE"
 
       - uses: actions/setup-python@v5
-        if: steps.rebase.outputs.changed == 'true'
+        if: steps.sync.outputs.changed == 'true'
         with:
           python-version: "3.12"
       - uses: actions/cache@v4
-        if: steps.rebase.outputs.changed == 'true'
+        if: steps.sync.outputs.changed == 'true'
         with:
           path: ~/.cache/uv
           key: ${{ runner.os }}-uv-3.12-${{ hashFiles('**/uv.lock') }}
@@ -139,11 +135,11 @@ jobs:
 
       # Upstream's PR check, verbatim: install, deps, lint, test, build.
       - name: make ci
-        if: steps.rebase.outputs.changed == 'true'
+        if: steps.sync.outputs.changed == 'true'
         run: make ci
 
       - name: Push feature branch
-        if: steps.rebase.outputs.changed == 'true'
+        if: steps.sync.outputs.changed == 'true'
         run: |
-          git push --force-with-lease="$FEATURE_BRANCH:$BEFORE" origin "HEAD:refs/heads/$FEATURE_BRANCH"
-          echo "Rebased \`$FEATURE_BRANCH\` onto upstream \`${UPSTREAM_SHA:0:10}\` (was \`${BEFORE:0:10}\`)." >> "$GITHUB_STEP_SUMMARY"
+          git push origin "HEAD:refs/heads/$FEATURE_BRANCH"
+          echo "Merged upstream \`${UPSTREAM_SHA:0:10}\` into \`$FEATURE_BRANCH\` (was \`${BEFORE:0:10}\`)." >> "$GITHUB_STEP_SUMMARY"
