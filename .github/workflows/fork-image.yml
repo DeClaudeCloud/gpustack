@@ -170,6 +170,15 @@ jobs:
           deep-clean: true
           root-reserve-mb: 20480
 
+      # Deep cleanup removes Python and the runner's tool cache.
+      - name: Restore Python for upgrade verification
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check upgrade verifier environment
+        run: python3 -c "import argparse, ast, hashlib, json, pathlib, subprocess, tempfile, time, uuid"
+
       # hack/install.sh packages whatever is in gpustack/ui when
       # UI_DOWNLOAD=false, adding upstream's extra static files and the Helm
       # chart on top, exactly as it does for a downloaded release.
