@@ -660,6 +660,7 @@ class PDModeEnum(str, Enum):
     """
 
     VLLM_NIXL = "vllm-nixl"
+    VLLM_MOONCAKE = "vllm-mooncake"
     SGLANG_MOONCAKE = "sglang-mooncake"
     SGLANG_NIXL = "sglang-nixl"
     VLLM_ASCEND_MOONCAKE = "vllm-ascend-mooncake"
@@ -740,8 +741,8 @@ class GatherSpec(BaseModel):
 
     Every value here names a layer the cluster actually declares, including
     `accelerator_domain`, which is an ordinary custom layer like any other.
-    `routes.models.validate_gather_layer` refuses anything else — the solver
-    stands an unknown layer down rather than failing, so an unchecked name
+    `validation.pd.placement.validate_gather_layer` refuses anything else — the
+    solver stands an unknown layer down rather than failing, so an unchecked name
     would be a `MustGather` nothing enforces.
     """
 
@@ -1241,7 +1242,7 @@ class Model(ModelBase, BaseModelMixin, table=True):
         sa_column=Column(UTCDateTime), default=None
     )
     """When `POST /{id}/restart` last tore this deployment down, cleared once
-    it is serving again. The window a second restart must be refused in.
+    it is serving again or stopped. The window a second restart must be refused in.
 
     **It exists because the fact is not derivable.** The rows cannot be asked:
     live members spanning more than one `spec_digest` reads like
@@ -1252,10 +1253,11 @@ class Model(ModelBase, BaseModelMixin, table=True):
     exactly those replacements and costs the group another full startup, with
     nothing in the UI to say why it went back to pending.
 
-    Cleared by `sync_model_status` on reaching RUNNING, and lapsing on its own
-    after `RESTART_IN_FLIGHT_LAPSE_SECONDS`. The lapse is not a tidy-up: a
-    group that never converges is precisely the one an operator needs to
-    restart again, and a guard with no expiry would answer 409 forever."""
+    Cleared by `sync_model_status` on reaching RUNNING or setting `replicas`
+    to zero, and lapsing on its own after `RESTART_IN_FLIGHT_LAPSE_SECONDS`.
+    The lapse is not a tidy-up: a group that never converges is precisely the
+    one an operator needs to restart again, and a guard with no expiry would
+    answer 409 forever."""
 
     instances: list["ModelInstance"] = Relationship(
         sa_relationship_kwargs={"cascade": "delete", "lazy": "noload"},
@@ -1775,6 +1777,13 @@ class ModelInstanceBase(SQLModel, ModelSource):
         sa_column=Column(pydantic_column_type(Dict[str, PortBand]), nullable=True),
     )
     """Connector ports by declared name. Values are bands, not points."""
+
+    router_peer_snapshot: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        sa_column=Column(JSON, nullable=True),
+    )
+    """Peers expected at creation, overwritten with peers rendered at router
+    startup. Engine identities allow address reuse to be detected."""
 
     draining_since: Optional[datetime] = Field(
         sa_column=Column(UTCDateTime), default=None

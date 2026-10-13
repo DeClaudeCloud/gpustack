@@ -39,7 +39,7 @@ from gpustack.schemas.pd_modes import (
     PDPortSpec,
 )
 from gpustack.server.pd_mode_catalog import get_pd_mode
-from gpustack.server.pd_pairing import (
+from gpustack.validation.pd.parameters import (
     selector_cards_per_replica,
     selector_spans_workers,
 )
@@ -497,6 +497,26 @@ def _pd_variables(
     context.update(_disaggregation_variables(getattr(model, "disaggregation", None)))
     context.update(_kv_lease_variables(mode))
     context.update(_cross_role_variables(model, instance))
+    if mode.connector_variants:
+        variant = (getattr(model, "meta", None) or {}).get(
+            "pd_connector_variant"
+        ) or mode.default_connector_variant
+        if not isinstance(variant, str) or variant not in mode.connector_variants:
+            if (
+                not isinstance(mode.default_connector_variant, str)
+                or mode.default_connector_variant not in mode.connector_variants
+            ):
+                raise PDInjectionError(
+                    f"PD mode '{mode.name}' declares connector variants but no "
+                    "usable default_connector_variant"
+                )
+            logger.warning(
+                "Unsupported PD connector variant metadata for model %s; using %s",
+                getattr(model, "id", None),
+                mode.default_connector_variant,
+            )
+            variant = mode.default_connector_variant
+        context["pd_connector"] = mode.connector_variants[variant]
     # The running role's own fields, unprefixed: a declaration referring to
     # its own parallelism writes {{tensor_parallel_size}}, and only the
     # cross-role case needs the prefix.
@@ -602,8 +622,8 @@ def _cross_role_variables(model, instance=None) -> Dict[str, object]:
     oversight: the injection is rendered on the worker as this member starts,
     and prefill routinely starts before decode has been placed at all, so its
     `gpu_indexes` may not exist yet. What the *spec* can still say is said —
-    `pd_pairing.selector_cards_per_replica` reads a peer that pinned its own
-    cards, which is the shape where the two sides provably differ. A peer that
+    `validation.pd.parameters.selector_cards_per_replica` reads a peer that
+    pinned its own cards, which is the shape where the two sides provably differ. A peer that
     pinned nothing falls back to the running member's count, deliberately: with
     no per-role pin both roles are sized by the same auto-selection of the same
     model on the same engine, and refusing to render there would break the
