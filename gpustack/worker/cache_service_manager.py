@@ -15,6 +15,7 @@ from gpustack_runtime.deployer import (
     ContainerExecution,
     ContainerProfileEnum,
     ContainerResources,
+    ContainerRestartPolicyEnum,
     WorkloadPlan,
     WorkloadStatusStateEnum,
     delete_workload,
@@ -385,6 +386,8 @@ class CacheServiceManager:
                 image=image,
                 name="default",
                 profile=ContainerProfileEnum.RUN,
+                # The manager applies restart_on_error, backoff and retry limits.
+                restart_policy=ContainerRestartPolicyEnum.NEVER,
                 execution=ContainerExecution(
                     privileged=False,
                     command=argv if overrides_entrypoint else None,
@@ -902,7 +905,7 @@ class CacheServiceManager:
         ) as unavailable_ports:
 
             def take() -> int:
-                port = network.get_free_port(
+                port = network.get_free_band(
                     port_range=self._config.service_port_range,
                     unavailable_ports=unavailable_ports,
                 )
@@ -917,7 +920,7 @@ class CacheServiceManager:
             # configuration turning one on — takes a fresh one and leaves
             # the rest alone.
             recorded = instance.ports or {}
-            ports: Dict[str, int] = {}
+            kept: Dict[str, int] = {}
             for name in names:
                 port = recorded.get(name)
                 if (
@@ -926,9 +929,10 @@ class CacheServiceManager:
                     and network.is_port_available(port)
                 ):
                     unavailable_ports.add(port)
-                    ports[name] = port
-                else:
-                    ports[name] = take()
+                    kept[name] = port
+            # Protect all reusable ports before a new declaration can take a
+            # lower-numbered port belonging to a later name in the list.
+            ports = {name: kept[name] if name in kept else take() for name in names}
             self._assigned_ports[instance.id] = tuple(ports.values())
             return ports
 
