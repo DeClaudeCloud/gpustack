@@ -63,9 +63,9 @@ dependencies = [
     "kubernetes-asyncio>=33.1.0,<34.0.0",
     "msgpack>=1.1.2",
     "cachetools>=6.0.0",
-    "gpustack-runner==0.1.31.post3",
+    "gpustack-runner==0.1.31.post4",
     "gpustack-runtime==0.2.6",
-    "gpustack-higress-plugins==0.5.0",
+    "gpustack-higress-plugins==0.5.0.post1",
     "websockets==16.0",
     "py-radix>=1.1.0",
     # Usage export, xlsx path only (CSV needs nothing beyond the stdlib).
@@ -107,6 +107,7 @@ docs = [
     "mkdocs-glightbox>=0.4.0",
     "mkdocs-redirects>=1.2.2",
     "mkdocs-minify-plugin>=0.8.0",
+    "jieba==0.42.1",
 ]
 
 [project.scripts]

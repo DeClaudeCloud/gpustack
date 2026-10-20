@@ -42,6 +42,7 @@ from gpustack.utils.convert import safe_int
 from gpustack.utils.attrs import set_attr
 from gpustack.utils.command import find_int_parameter
 from gpustack.utils.process import terminate_process_tree, add_signal_handlers
+from gpustack.worker.backends.base import PD_CONFIGURATION_CHANGED_MESSAGE
 from gpustack.worker.backends.ascend_mindie import AscendMindIEServer
 from gpustack.worker.backends.sglang import SGLangServer
 from gpustack.utils.command import resolve_executor_backend
@@ -112,6 +113,7 @@ _INFERENCE_HEALTH_CHECK_FAILED_MESSAGE = "Inference health check failed."
 
 # Last-resort message for a workload that stopped serving without saying why.
 _WORKLOAD_FAILED_MESSAGE = "Inference server exited or unhealthy."
+_SUBORDINATE_ERROR_PREFIX = "Distributed serving error in subordinate worker "
 
 # vLLM excludes a ten-port window starting at VLLM_DP_MASTER_PORT from its
 # other automatic port selections. Protect that window for MP topologies
@@ -764,6 +766,12 @@ class ServeManager(ContainerLogPersister):
                                 sw_pos
                             ]
                             sw.state = ModelInstanceStateEnum.ERROR
+                            # Keep workload failures identifiable after the runtime
+                            # clears its diagnosis, without losing the details.
+                            if not failure_message.startswith(_WORKLOAD_FAILED_MESSAGE):
+                                failure_message = (
+                                    f"{_WORKLOAD_FAILED_MESSAGE} {failure_message}"
+                                )
                             sw.state_message = failure_message
                             patch_dict = {
                                 f"distributed_servers.subordinate_workers.{sw_pos}": sw,
@@ -818,13 +826,28 @@ class ServeManager(ContainerLogPersister):
                     if subordinate_state is None:
                         if model_instance.state == ModelInstanceStateEnum.RUNNING:
                             self._restart_backoff_counts.pop(model_instance.id, None)
+                            self._error_model_instances.pop(model_instance.id, None)
+                            self._pending_model_instance_errors.pop(
+                                model_instance.id, None
+                            )
                             continue
 
+                        # A recovered follower can clear its propagated failure;
+                        # independent leader failures still require recovery.
                         if (
                             model_instance.state == ModelInstanceStateEnum.ERROR
-                            or not is_ready(
-                                backend, model_instance, health_check_path, model
+                            and not (
+                                model_instance.distributed_servers
+                                and model_instance.distributed_servers.mode
+                                == DistributedServerCoordinateModeEnum.INITIALIZE_LATER
+                                and (model_instance.state_message or "").startswith(
+                                    _SUBORDINATE_ERROR_PREFIX
+                                )
                             )
+                        ):
+                            continue
+                        if not is_ready(
+                            backend, model_instance, health_check_path, model
                         ):
                             continue
 
@@ -868,15 +891,22 @@ class ServeManager(ContainerLogPersister):
                     )
                     sw = model_instance.distributed_servers.subordinate_workers[sw_pos]
                     if sw.state == ModelInstanceStateEnum.RUNNING:
+                        self._error_model_instances.pop(model_instance.id, None)
+                        self._pending_model_instance_errors.pop(model_instance.id, None)
                         continue
                     if (
                         model_instance.distributed_servers.mode
                         == DistributedServerCoordinateModeEnum.INITIALIZE_LATER
                     ):
-                        # Startup sets RUNNING directly in this mode. Only repair
-                        # an unreachable subordinate with a surviving workload;
-                        # the main worker still owns the engine readiness check.
-                        if sw.state != ModelInstanceStateEnum.UNREACHABLE:
+                        # Reconcile surviving workloads without starting work.
+                        # The leader owns engine readiness; explicit backend and
+                        # inference failures remain terminal.
+                        if workload.state != WorkloadStatusStateEnum.RUNNING or (
+                            sw.state == ModelInstanceStateEnum.ERROR
+                            and not (sw.state_message or "").startswith(
+                                _WORKLOAD_FAILED_MESSAGE
+                            )
+                        ):
                             continue
                         if recovery_worker is None:
                             recovery_worker = self._clientset.workers.get(
@@ -900,6 +930,12 @@ class ServeManager(ContainerLogPersister):
                     }
                 # Update model instance.
                 self._update_model_instance(model_instance.id, **patch_dict)
+                if (
+                    patch_dict.get("state") == ModelInstanceStateEnum.RUNNING
+                    or not is_main_worker
+                ):
+                    self._error_model_instances.pop(model_instance.id, None)
+                    self._pending_model_instance_errors.pop(model_instance.id, None)
 
     @staticmethod
     def _get_main_worker_distributed_state(
@@ -937,7 +973,7 @@ class ServeManager(ContainerLogPersister):
                 "should_update": model_instance.state != ModelInstanceStateEnum.ERROR,
                 "state": ModelInstanceStateEnum.ERROR,
                 "state_message": (
-                    f"Distributed serving error in subordinate worker "
+                    f"{_SUBORDINATE_ERROR_PREFIX}"
                     f"{error_sw.worker_ip}: {error_sw.state_message}."
                 ),
             }
@@ -1410,6 +1446,10 @@ class ServeManager(ContainerLogPersister):
                 self._error_model_instances[mi.id] = mi
                 return
 
+            if mi.state == ModelInstanceStateEnum.RUNNING:
+                self._error_model_instances.pop(mi.id, None)
+                self._pending_model_instance_errors.pop(mi.id, None)
+
             # Restart if scheduled and this is the assigned worker.
             if is_main_worker and mi.state == ModelInstanceStateEnum.SCHEDULED:
                 self._restart_model_instance(mi)
@@ -1460,10 +1500,12 @@ class ServeManager(ContainerLogPersister):
         )
         # The parent can still be STARTING after this follower fails. Its
         # local state distinguishes first launch from recovery on later events.
-        if not initial_start and not self._auto_restart_enabled(mi):
+        if not initial_start and not self._auto_restart_enabled(
+            mi, use_cache=not bool(mi.group_id)
+        ):
             logger.debug(
                 "Skipping recovery of model instance %s on worker %s: "
-                "automatic restart is disabled.",
+                "automatic recovery is not allowed.",
                 mi.name,
                 self._worker_id,
             )
@@ -1903,6 +1945,14 @@ class ServeManager(ContainerLogPersister):
             )
             self._stop_model_instance(mi, delete_logs=True)
             return
+        except Exception as e:
+            self._handle_model_instance_launch_failure(mi, e)
+            return
+        try:
+            if mi.group_id:
+                model = self._clientset.models.get(mi.model_id, use_cache=False)
+                if model.stale is True:
+                    raise RuntimeError(PD_CONFIGURATION_CHANGED_MESSAGE)
         except Exception as e:
             self._handle_model_instance_launch_failure(mi, e)
             return
@@ -2769,23 +2819,43 @@ class ServeManager(ContainerLogPersister):
             logger.debug(f"Model instance {mi.name} is provisioning. Skipping restart.")
             return
 
-        if not self._auto_restart_enabled(mi):
-            self._error_model_instances.pop(mi.id, None)
-            return
-
-        restart_count = mi.restart_count or 0
         backoff_count = self._restart_backoff_counts.get(mi.id, 0)
-        last_restart_time = mi.last_restart_time or mi.updated_at
-
         current_time = datetime.now(timezone.utc)
         delay = min(10 * (2 ** (backoff_count - 1)), 300) if backoff_count > 0 else 0
-        if backoff_count > 0 and last_restart_time:
-            elapsed_time = (current_time - last_restart_time).total_seconds()
-            if elapsed_time < delay:
-                logger.trace(
-                    f"Delaying restart of {mi.name} for {delay - elapsed_time:.2f} seconds."
-                )
-                return
+        if self._restart_backoff_pending(mi, delay, current_time):
+            return
+
+        # Watch events and the restart loop's queue snapshot can lag recovery.
+        # Bypass the watch cache to check whether an error still exists.
+        try:
+            mi = self._clientset.model_instances.get(id=mi.id, use_cache=False)
+        except NotFoundException:
+            self._error_model_instances.pop(mi.id, None)
+            self._pending_model_instance_errors.pop(mi.id, None)
+            return
+
+        if self._worker_id not in member_worker_ids(mi):
+            self._error_model_instances.pop(mi.id, None)
+            self._pending_model_instance_errors.pop(mi.id, None)
+            return
+
+        subordinate_error = mi.distributed_servers and any(
+            sw.worker_id == self._worker_id and sw.state == ModelInstanceStateEnum.ERROR
+            for sw in mi.distributed_servers.subordinate_workers or []
+        )
+        if mi.state != ModelInstanceStateEnum.ERROR and not subordinate_error:
+            self._error_model_instances.pop(mi.id, None)
+            self._pending_model_instance_errors.pop(mi.id, None)
+            return
+
+        # Another worker may have restarted the instance since it was queued.
+        if self._restart_backoff_pending(mi, delay, current_time):
+            return
+
+        # Only a PD recovery that is due needs current model configuration.
+        if not self._auto_restart_enabled(mi, use_cache=not bool(mi.group_id)):
+            self._error_model_instances.pop(mi.id, None)
+            return
 
         logger.info(
             f"Restarting model instance {mi.name} "
@@ -2796,7 +2866,7 @@ class ServeManager(ContainerLogPersister):
             self._restart_backoff_counts[mi.id] = backoff_count + 1
             self._update_model_instance(
                 mi.id,
-                restart_count=restart_count + 1,
+                restart_count=(mi.restart_count or 0) + 1,
                 last_restart_time=current_time,
                 state=ModelInstanceStateEnum.SCHEDULED,
                 state_message="",
@@ -2806,13 +2876,28 @@ class ServeManager(ContainerLogPersister):
         # if failed to restart next time, it will be added again in watch_model_instance_events().
         self._error_model_instances.pop(mi.id, None)
 
-    def _auto_restart_enabled(self, mi: ModelInstance) -> bool:
-        """Read the live recovery policy rather than the launch-time model cache."""
+    def _restart_backoff_pending(
+        self, mi: ModelInstance, delay: float, current_time: datetime
+    ) -> bool:
+        """Check retry timing locally before reading instance or model state."""
+        last_restart_time = mi.last_restart_time or mi.updated_at
+        if not delay or not last_restart_time:
+            return False
+        remaining = delay - (current_time - last_restart_time).total_seconds()
+        if remaining <= 0:
+            return False
+        logger.trace(f"Delaying restart of {mi.name} for {remaining:.2f} seconds.")
+        return True
+
+    def _auto_restart_enabled(self, mi: ModelInstance, use_cache: bool = True) -> bool:
+        """Use the watch cache for polling and refresh before PD recovery."""
         try:
-            model = self._clientset.models.get(mi.model_id)
+            model = self._clientset.models.get(mi.model_id, use_cache=use_cache)
         except NotFoundException:
             return False
-        return bool(model.restart_on_error)
+        return bool(model.restart_on_error) and not (
+            mi.group_id and model.stale is True
+        )
 
     def _get_model(self, mi: ModelInstance) -> Model:
         """
