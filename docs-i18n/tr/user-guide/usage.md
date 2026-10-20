@@ -20,6 +20,8 @@ Sekmeler şunlardır:
 - **Depolama** — depolama kapasitesi kullanımı, depolamaya/kullanıcıya göre ayrılmış.
 - **Kaynak Olayları** — işlem/depolama numaralarının arkasındaki yaşam döngüsü denetim günlüğü.
 
+Tek tek çıkarım istekleri, gezinmede `Usage` öğesinin yanındaki ayrı [Request Logs](#request-logs) sayfasında listelenir.
+
 ## Ne ölçülür { #what-gets-metered }
 
 | Kaynak | Ölçülüyken… | Kova ayrıntı düzeyi |
@@ -121,6 +123,34 @@ Ayrıntı tablosu şu şekilde gruplandırılır:
 İşlem ve depolama ölçümlerini açıklayan yaşam döngüsü denetim günlüğüdür; ölçümle ilgili her durum geçişi için bir satır bulunur. Bir değerin neden öyle olduğunu anlamaya yardımcı olur.
 
 Filtreler: **tarih aralığı**, **kaynak türü** (GPU Örneği / Depolama), **olay türü** ve bulanık **kaynak adı** arama.
+
+## İstek Günlükleri { #request-logs }
+
+![İstek Günlükleri](../assets/usage/usage-request-logs.png)
+
+Her çıkarım isteği için bir satır, en yenisi en üstte — Tokens sayılarının arkasındaki istek bazlı görünüm. Gezinmedeki `Request Logs` öğesinden açın.
+
+- **İstatistikler** — toplam istek, başarı oranı, kullanıcı başarısı, ortalama ve p95 gecikme, ilk tokendan sonra saniyedeki token sayısı olarak çıktı hızı ve ortalama ilk token süresi, ayrıca toplam girdi ve çıktı tokenları. Her biri, seçilen dönemden hemen önceki eşit uzunluktaki dönemle karşılaştırılır.
+- **İstek hacmi** — zaman içinde başarılı, başarısız ve tamamlanmamış istekler.
+- **Tablo** — zaman, tür, durum, istek kimliği, model, süre, ilk token süresi, çıktı hızı, tokenlar, API anahtarı, kullanıcı aracısı ve (Yöneticiler için) kullanıcı. İsteğin tüm ayrıntılarını görmek için bir satırı veya istek kimliğini seçin; buna ağ geçidinin çağırana `X-GPUStack-Request-Id` yanıt başlığında döndürdüğü ağ geçidi istek kimliği de dahildir.
+
+Filtreler: **zaman aralığı** (son 15 dakikadan son 30 güne kadar veya özel aralık), istek kimliği, yanıt kimliği veya modele göre **arama**, **durum**, **model**, **API anahtarı**, **kullanıcı** (yalnızca Yöneticiler) ve **akış**. Yeni istekleri tamamlandıkça izlemek için **Live** özelliğini açın; göreli zaman aralıklarında kullanılabilir.
+
+Bir isteğin durumu şunlardan biridir:
+
+| Durum      | Anlamı                                                                                                                                    |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Success    | Model bir yanıt döndürdü.                                                                                                                 |
+| Error      | İstek başarısız oldu veya yukarı akış bir model yanıtı döndürmedi.                                                                        |
+| Incomplete | Yanıt, token kullanımı bildirilmeden önce sona erdi: istemci bağlantıyı kesti veya yukarı akış yanıtın ortasında durdu. Token sayıları tahminidir. |
+
+**Kullanıcı başarısı**, yedek bir hedefte yeniden denenen isteği bir kez sayar ve denemelerden biri başarılıysa başarılı kabul eder; **başarı oranı** her denemeyi sayar.
+
+!!! note
+
+    İstekler tamamlandıktan birkaç saniye sonra görünür. Ağ geçidinin bir modele ulaşmadan önce reddettiği istekler (geçersiz bir API anahtarı veya bilinmeyen bir model adı) listelenmez. Bu sayfadaki saatler tarayıcınızın saat diliminde gösterilir.
+
+    Ağ geçidi üzerinden sunulan bir isteğin kullanıcı aracısı, gömülü ağ geçidinin erişim günlüğünden okunur; bu nedenle GPUStack ağ geçidini gömülü olarak çalıştırdığında (kapsayıcı imajının varsayılanı) gösterilir, küme içi veya harici bir ağ geçidiyle boş kalır.
 
 ## Saat Dilimi { #timezone }
 
