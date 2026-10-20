@@ -62,3 +62,21 @@ Rerun the workflow to verify against that new baseline. Schema coverage uses
 PostgreSQL; supported compatible databases still require portable migration
 DDL and their existing unit checks. Arbitrary production data transformations
 need focused regression tests in addition to the deployment canary.
+
+## Explicit GGUF VRAM reservation
+
+For a GGUF deployment with exactly one manually selected GPU, set the model's
+**environment variable** `GPUSTACK_MODEL_VRAM_CLAIM` to a positive integer in
+bytes. For example, `96636764160` reserves 90 GiB. The full-offload scheduler
+uses that reservation for both discrete and unified-memory GPUs. RAM retains
+its calculated estimate, and available-memory checks still apply. Automatic GPU
+selection and multi-GPU overrides are rejected.
+
+This controls the scheduler's reservation, not the inference process's memory
+use. Keep the backend arguments needed for the model's actual memory layout;
+loading can still fail if those arguments exceed physical memory. Partial and
+CPU offload estimates remain calculated. `GPUSTACK_SKIP_MODEL_EVALUATION` does
+not replace this scheduler reservation setting.
+
+Update the server image and restart the deployment to schedule it again. Workers
+do not need the fork image for this scheduler change.

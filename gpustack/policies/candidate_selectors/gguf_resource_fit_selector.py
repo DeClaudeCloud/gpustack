@@ -317,6 +317,35 @@ class GGUFResourceFitSelector(ScheduleCandidatesSelector):
         ]
         full_offload_item = full_offload_result.resource_claim_estimate.items[0]
 
+        declared_vram = (self._model.env or {}).get("GPUSTACK_MODEL_VRAM_CLAIM")
+        if declared_vram is not None:
+            if len(self._selected_gpu_ids) != 1 or len(full_offload_item.vrams) != 1:
+                raise ValueError(
+                    "GGUF VRAM override requires exactly one manually selected GPU"
+                )
+            try:
+                vram_bytes = int(declared_vram)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(
+                    "GPUSTACK_MODEL_VRAM_CLAIM must be a positive integer in bytes"
+                ) from exc
+            if vram_bytes <= 0:
+                raise ValueError(
+                    "GPUSTACK_MODEL_VRAM_CLAIM must be a positive integer in bytes"
+                )
+            # Keep the parser's partial-offload estimates independent of the
+            # explicit full-offload reservation.
+            full_offload_item = copy.deepcopy(full_offload_item)
+            full_offload_result.resource_claim_estimate.items = [full_offload_item]
+            full_offload_item.vrams[0].nonuma = vram_bytes
+            full_offload_item.vrams[0].uma = vram_bytes
+            logger.warning(
+                "GGUF model %s explicitly reserves %s bytes VRAM; runtime memory "
+                "use is unchanged",
+                self._model.name,
+                vram_bytes,
+            )
+
         self._full_offload_resource_claim = full_offload_result.resource_claim_estimate
         self._partial_offload_resource_claim = result.resource_claim_estimate
         self._disable_offload_result_claim = (
