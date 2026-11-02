@@ -144,7 +144,7 @@ from alembic.config import Config as AlembicConfig
 from gpustack.websocket_proxy.proxy_server import HTTPSProxyServer, StallPolicy
 from gpustack.utils.stall import stall_error_json, stall_error_sse
 from gpustack.api.auth import (
-    authenticate_worker_by_request_headers,
+    authenticate_proxy_request_headers,
 )
 
 from gpustack.gpu_instances import gateway_client
@@ -1054,7 +1054,7 @@ class Server:
 
             # Store the deployment token under the pair authentication
             # resolves it to: its own access key when it is in the standard
-            # shape, the empty access key otherwise.
+            # shape, the reserved deployment-token access key otherwise.
             access_key, secret_key = migrated_token_key_pair(self._config.token)
             new_key = ApiKey(
                 name="Legacy Cluster Token",
@@ -1402,9 +1402,7 @@ class Server:
             host=self._config.get_proxy_listen_address(),
             port=self._config.get_proxy_port(),
             connection_manager_getter=app.state.message_server_handler.get_connection_manager,
-            authenticator=lambda headers: authenticate_worker_by_request_headers(
-                headers, validate_proxy=None
-            ),
+            authenticator=authenticate_proxy_request_headers,
             header_router=resolve_instance_address_from_model_header,
             stall_policy=StallPolicy(
                 ttft_timeout=envs.PROXY_TTFT_TIMEOUT,

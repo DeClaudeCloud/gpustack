@@ -25,6 +25,7 @@ from gpustack.api.exceptions import (
 )
 from gpustack.extension import Plugin, PluginContext
 from gpustack.schemas.config import GatewayModeEnum
+from gpustack.security import LEGACY_TOKEN_ACCESS_KEY
 from gpustack.schemas.users import AuthProviderEnum
 from gpustack.routes import auth as auth_route
 from gpustack.routes.auth import oidc_callback
@@ -284,26 +285,28 @@ async def test_get_user_from_api_token_prefers_the_digest(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_standard_format_token_falls_back_to_the_legacy_cluster_row(monkeypatch):
-    """The legacy cluster token row (empty access key, hash of the whole
-    deployment-supplied string) must stay reachable when the token parses in
-    the standard shape: a migrated v2.x registration token looks exactly like
-    a key this database issued, and no row exists under its parsed access
-    key."""
+@pytest.mark.parametrize("stored_access", ["", LEGACY_TOKEN_ACCESS_KEY])
+async def test_standard_format_token_falls_back_to_the_legacy_cluster_row(
+    monkeypatch, stored_access
+):
+    """A whole-token hash remains reachable through either legacy marker when
+    a standard-shaped token has no row under its parsed access key."""
     from gpustack.api.auth import get_user_from_api_token
     from gpustack.security import generate_access_key, generate_secret_key
 
     access_key = generate_access_key()
     secret_key = generate_secret_key()
     token = f"gpustack_{access_key}_{secret_key}"
-    legacy_row = _api_token_double(access_key="", hashed_secret_key="stored-hash")
+    legacy_row = _api_token_double(
+        access_key=stored_access, hashed_secret_key="stored-hash"
+    )
     expected_user = type("User", (), {"is_active": True, "id": 7})()
 
     lookups = []
 
     async def fake_get_by_access_key(self, candidate):
         lookups.append(candidate)
-        return legacy_row if candidate == "" else None
+        return legacy_row if candidate == stored_access else None
 
     async def fake_get_by_id(self, user_id):
         return expected_user
@@ -322,24 +325,23 @@ async def test_standard_format_token_falls_back_to_the_legacy_cluster_row(monkey
 
     assert user is expected_user
     assert api_key is legacy_row
-    # The parsed access key is tried first; the empty-key row is the fallback.
-    assert lookups == [access_key, ""]
+    assert lookups == [access_key, LEGACY_TOKEN_ACCESS_KEY, ""]
 
 
 @pytest.mark.asyncio
-async def test_legacy_row_still_accepts_the_secret_portion(monkeypatch):
-    """The same empty-access-key row can hold the hash of only the secret
-    portion (the pre-2.0 worker shape); the UUID-wrapped presentation must
-    keep verifying against it."""
+@pytest.mark.parametrize("stored_access", ["", LEGACY_TOKEN_ACCESS_KEY])
+async def test_legacy_row_still_accepts_the_secret_portion(monkeypatch, stored_access):
+    """A UUID-wrapped worker token verifies its secret against either legacy
+    access-key representation."""
     from gpustack.api.auth import get_user_from_api_token
 
     wrapped = "gpustack_3192253c-c11c-75ed-6334-ea9505da4ad9_raw-secret"
-    row = _api_token_double(access_key="", hashed_secret_key="stored-hash")
+    row = _api_token_double(access_key=stored_access, hashed_secret_key="stored-hash")
     expected_user = type("User", (), {"is_active": True, "id": 7})()
 
     async def fake_get_by_access_key(self, candidate):
-        assert candidate == ""  # the UUID is remapped before the lookup
-        return row
+        assert candidate in (LEGACY_TOKEN_ACCESS_KEY, "")
+        return row if candidate == stored_access else None
 
     async def fake_get_by_id(self, user_id):
         return expected_user
@@ -367,7 +369,93 @@ async def test_legacy_row_still_accepts_the_secret_portion(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_existing_standard_row_skips_the_empty_key_fallback(monkeypatch):
+@pytest.mark.parametrize("shape", ["opaque", "uuid-secret", "uuid-whole", "standard"])
+@pytest.mark.parametrize(
+    "marker_matches, marker_expired, empty_matches, empty_expired, expected_access",
+    [
+        (False, False, True, False, ""),
+        (True, True, True, False, ""),
+        (True, False, True, False, LEGACY_TOKEN_ACCESS_KEY),
+        (False, False, False, False, None),
+        (False, False, True, True, None),
+    ],
+)
+async def test_coexisting_legacy_rows_verify_each_live_candidate(
+    monkeypatch,
+    shape,
+    marker_matches,
+    marker_expired,
+    empty_matches,
+    empty_expired,
+    expected_access,
+):
+    """A legacy marker must not shadow another live deployment credential."""
+    from gpustack.api.auth import get_user_from_api_token
+
+    secret = "deployment-secret"
+    if shape.startswith("uuid"):
+        token = f"gpustack_3192253c-c11c-75ed-6334-ea9505da4ad9_{secret}"
+    elif shape == "standard":
+        token = f"gpustack_3192253c1f4a9b7e_{secret}"
+    else:
+        token = secret
+    plaintext = secret if shape in ("opaque", "uuid-secret") else token
+    expired_at = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    rows = {
+        LEGACY_TOKEN_ACCESS_KEY: _api_token_double(
+            id=11,
+            user_id=7,
+            access_key=LEGACY_TOKEN_ACCESS_KEY,
+            hashed_secret_key="marker-hash",
+            expires_at=expired_at if marker_expired else None,
+        ),
+        "": _api_token_double(
+            id=12,
+            user_id=8,
+            access_key="",
+            hashed_secret_key="empty-hash",
+            expires_at=expired_at if empty_expired else None,
+        ),
+    }
+    expected_plaintexts = {
+        "marker-hash": plaintext if marker_matches else "different-secret",
+        "empty-hash": plaintext if empty_matches else "different-secret",
+    }
+    events = []
+
+    async def lookup(self, access_key):
+        assert "rollback" not in events
+        events.append(("lookup", access_key))
+        return rows.get(access_key)
+
+    def verify(hashed, presented):
+        assert "rollback" in events
+        assert not (hashed == "marker-hash" and marker_expired)
+        assert not (hashed == "empty-hash" and empty_expired)
+        events.append(("verify", hashed))
+        return expected_plaintexts[hashed] == presented
+
+    get_user = AsyncMock(side_effect=lambda user_id: _principal_double(id=user_id))
+    monkeypatch.setattr("gpustack.api.auth.APIKeyService.get_by_access_key", lookup)
+    monkeypatch.setattr("gpustack.api.auth.UserService.get_by_id", get_user)
+    monkeypatch.setattr("gpustack.api.auth.verify_hashed_secret", verify)
+
+    user, key = await get_user_from_api_token(_RollbackRecordingSession(events), token)
+
+    if expected_access is None:
+        assert user is None and key is None
+        get_user.assert_not_awaited()
+    else:
+        assert key is rows[expected_access]
+        assert user.id == key.user_id
+        get_user.assert_awaited_once_with(user_id=key.user_id)
+        if expected_access == LEGACY_TOKEN_ACCESS_KEY:
+            assert ("verify", "empty-hash") not in events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("valid", [True, False])
+async def test_existing_standard_row_skips_the_empty_key_fallback(monkeypatch, valid):
     """A token whose parsed access key resolves pays no extra lookup: the
     fallback exists for misses only."""
     from gpustack.api.auth import get_user_from_api_token
@@ -388,7 +476,7 @@ async def test_existing_standard_row_skips_the_empty_key_fallback(monkeypatch):
         return expected_user
 
     def fake_verify(hashed, secret):
-        return secret == secret_key
+        return valid and secret == secret_key
 
     monkeypatch.setattr(
         "gpustack.api.auth.APIKeyService.get_by_access_key", fake_get_by_access_key
@@ -400,25 +488,27 @@ async def test_existing_standard_row_skips_the_empty_key_fallback(monkeypatch):
         _RollbackRecordingSession([]), f"gpustack_{access_key}_{secret_key}"
     )
 
-    assert user is expected_user
-    assert api_key is row
+    if valid:
+        assert user is expected_user
+        assert api_key is row
+    else:
+        assert user is None and api_key is None
     assert lookups == [access_key]
 
 
 @pytest.mark.asyncio
-async def test_standard_format_guess_pays_a_single_verify(monkeypatch):
-    """An invalid standard-format token that reaches the empty-key row is
-    verified against the whole string alone: no empty-key row ever held just
-    the secret portion of a standard-format token, and trying it would double
-    the argon2 cost a brute-force guess can impose on every request."""
+@pytest.mark.parametrize("stored_access", ["", LEGACY_TOKEN_ACCESS_KEY])
+async def test_standard_format_guess_pays_a_single_verify(monkeypatch, stored_access):
+    """An invalid standard-format token reaching a deployment-token row pays
+    only one argon2 verify, against the whole string."""
     from gpustack.api.auth import get_user_from_api_token
     from gpustack.security import generate_access_key, generate_secret_key
 
     token = f"gpustack_{generate_access_key()}_{generate_secret_key()}"
-    row = _api_token_double(access_key="", hashed_secret_key="stored-hash")
+    row = _api_token_double(access_key=stored_access, hashed_secret_key="stored-hash")
 
     async def fake_get_by_access_key(self, candidate):
-        return row if candidate == "" else None
+        return row if candidate == stored_access else None
 
     verified_plaintexts = []
 
@@ -438,9 +528,12 @@ async def test_standard_format_guess_pays_a_single_verify(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("shape", ["standard", "uuid-wrapped", "opaque"])
+@pytest.mark.parametrize(
+    "shape", ["standard", "uuid-wrapped", "opaque", "opaque-raw", "empty-access"]
+)
+@pytest.mark.parametrize("valid", [True, False])
 async def test_migrated_row_authenticates_the_presentation_workers_send(
-    monkeypatch, shape
+    monkeypatch, shape, valid
 ):
     """Reader/writer agreement: the row ``_migrate_legacy_token`` builds
     (security.migrated_token_key_pair) authenticates the presentation the
@@ -461,13 +554,22 @@ async def test_migrated_row_authenticates_the_presentation_workers_send(
     elif shape == "uuid-wrapped":
         config_token = f"gpustack_{uuid_form}_{generate_secret_key()}"
         presented = config_token
+    elif shape == "empty-access":
+        config_token = "gpustack__secret"
+        presented = config_token
+    elif shape == "opaque-raw":
+        config_token = "123456"
+        presented = config_token
     else:
         config_token = "deployment-supplied-secret"
         # The worker client wraps an unprefixed token before sending it
         # (config.registration.registration_client).
         presented = f"gpustack_{uuid_form}_{config_token}"
 
+    if not valid:
+        presented += "-wrong"
     stored_access, stored_secret = migrated_token_key_pair(config_token)
+    assert stored_access
     row = _api_token_double(
         access_key=stored_access,
         hashed_secret_key=get_secret_hash(stored_secret),
@@ -492,8 +594,11 @@ async def test_migrated_row_authenticates_the_presentation_workers_send(
         _RollbackRecordingSession([]), presented
     )
 
-    assert user is expected_user
-    assert api_key is row
+    if valid:
+        assert user is expected_user
+        assert api_key is row
+    else:
+        assert user is None and api_key is None
 
 
 @pytest.mark.asyncio
@@ -2573,3 +2678,191 @@ async def test_a_credential_failure_401_is_not_a_policy_rejection(monkeypatch):
         await authenticate_request(request, x_api_key="no-such-key")
 
     assert not is_policy_rejection(raised.value)
+
+
+# --- Forward-proxy request authentication (tunnel mode) ----------------------
+#
+# The server's forward proxy authenticates every request it relays. The
+# accepted credentials are the derived gateway token (what the built-in
+# Prometheus scrape job presents) and a principal's API key (what
+# pd_membership hops and gateway-forwarded clients present).
+
+
+_PROXY_GATEWAY_TOKEN = "derived-gateway-token"
+
+
+def _proxy_token_config(monkeypatch):
+    monkeypatch.setattr(
+        "gpustack.api.auth.get_global_config",
+        lambda: SimpleNamespace(get_derived_gateway_token=lambda: _PROXY_GATEWAY_TOKEN),
+    )
+
+
+def _proxy_api_key_lookup(monkeypatch, principal):
+    monkeypatch.setattr(
+        "gpustack.api.auth.authenticate_worker_by_request_headers",
+        AsyncMock(return_value=principal),
+    )
+
+
+@pytest.mark.asyncio
+async def test_proxy_auth_accepts_gateway_token_in_authorization(monkeypatch):
+    from gpustack.api.auth import authenticate_proxy_request_headers
+
+    _proxy_token_config(monkeypatch)
+    _proxy_api_key_lookup(monkeypatch, None)
+
+    headers = {"Authorization": f"Bearer {_PROXY_GATEWAY_TOKEN}"}
+    assert await authenticate_proxy_request_headers(headers)
+    # Authorization is end-to-end, so the proxy would forward it; the hop
+    # credential is consumed instead of travelling on to the target.
+    assert "authorization" not in {k.lower() for k in headers}
+
+
+@pytest.mark.asyncio
+async def test_proxy_auth_accepts_gateway_token_in_proxy_authorization(monkeypatch):
+    from gpustack.api.auth import authenticate_proxy_request_headers
+
+    _proxy_token_config(monkeypatch)
+    _proxy_api_key_lookup(monkeypatch, None)
+
+    headers = {"Proxy-Authorization": f"Bearer {_PROXY_GATEWAY_TOKEN}"}
+    assert await authenticate_proxy_request_headers(headers)
+    # Proxy-Authorization is hop-by-hop and stripped by the proxy before
+    # forwarding; the authenticator leaves it alone.
+    assert headers == {"Proxy-Authorization": f"Bearer {_PROXY_GATEWAY_TOKEN}"}
+
+
+@pytest.mark.asyncio
+async def test_proxy_auth_reads_the_hop_credential_first(monkeypatch):
+    # Proxy-Authorization is the credential for the proxy hop; when it is
+    # present it is the only token considered, even if Authorization holds
+    # a valid gateway token.
+    from gpustack.api.auth import authenticate_proxy_request_headers
+
+    _proxy_token_config(monkeypatch)
+    _proxy_api_key_lookup(monkeypatch, None)
+
+    assert await authenticate_proxy_request_headers(
+        {
+            "Proxy-Authorization": f"Bearer {_PROXY_GATEWAY_TOKEN}",
+            "Authorization": "Bearer something-else",
+        }
+    )
+    headers = {
+        "Proxy-Authorization": "Bearer not-the-gateway-token",
+        "Authorization": f"Bearer {_PROXY_GATEWAY_TOKEN}",
+    }
+    assert not await authenticate_proxy_request_headers(headers)
+    # The gateway token never travels on to a target, even when the
+    # request itself is being rejected on the other credential.
+    assert not any(k.lower() == "authorization" for k in headers)
+
+
+@pytest.mark.asyncio
+async def test_proxy_auth_consumes_gateway_token_even_on_api_key_hop(monkeypatch):
+    # The API key in Proxy-Authorization authenticates the hop, but a
+    # gateway token sitting in Authorization must still be consumed
+    # before the proxy forwards the request to the target.
+    from gpustack.api.auth import authenticate_proxy_request_headers
+
+    _proxy_token_config(monkeypatch)
+    principal = SimpleNamespace(id=1)
+    _proxy_api_key_lookup(monkeypatch, principal)
+
+    headers = {
+        "Proxy-Authorization": "Bearer access:secret",
+        "Authorization": f"Bearer {_PROXY_GATEWAY_TOKEN}",
+    }
+    assert await authenticate_proxy_request_headers(headers)
+    assert not any(k.lower() == "authorization" for k in headers)
+
+
+@pytest.mark.asyncio
+async def test_proxy_auth_falls_back_to_api_key_check(monkeypatch):
+    from gpustack.api.auth import authenticate_proxy_request_headers
+
+    _proxy_token_config(monkeypatch)
+    principal = SimpleNamespace(id=1)
+    _proxy_api_key_lookup(monkeypatch, principal)
+
+    assert await authenticate_proxy_request_headers(
+        {"Proxy-Authorization": "Bearer access:secret"}
+    )
+    # An API key in Authorization is the target's own credential
+    # (gateway-forwarded requests rely on it reaching the instance), so
+    # it is not consumed by the hop check.
+    headers = {"Authorization": "Bearer access:secret"}
+    assert await authenticate_proxy_request_headers(headers)
+    assert headers == {"Authorization": "Bearer access:secret"}
+
+
+@pytest.mark.asyncio
+async def test_proxy_auth_rejects_non_ascii_token_without_raising(monkeypatch):
+    # compare_digest rejects str arguments with non-ASCII characters, and
+    # a client-supplied header can carry them; the outcome must be a
+    # plain rejection, not a TypeError surfacing as a 500.
+    from gpustack.api.auth import authenticate_proxy_request_headers
+
+    _proxy_token_config(monkeypatch)
+    _proxy_api_key_lookup(monkeypatch, None)
+
+    assert not await authenticate_proxy_request_headers(
+        {"Authorization": "Bearer fälschung-nicht-ascii"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_gateway_token_never_reaches_the_proxied_target(monkeypatch):
+    # End to end over the proxy's own header filter: after a successful
+    # gateway-token authentication nothing credential-shaped survives in
+    # the headers the proxy would forward.
+    from gpustack.api.auth import authenticate_proxy_request_headers
+    from gpustack.websocket_proxy.proxy_server import _filter_headers
+
+    _proxy_token_config(monkeypatch)
+    _proxy_api_key_lookup(monkeypatch, None)
+
+    headers = {
+        "authorization": f"Bearer {_PROXY_GATEWAY_TOKEN}",
+        "accept": "text/plain",
+    }
+    assert await authenticate_proxy_request_headers(headers)
+    forwarded = _filter_headers(headers)
+    assert forwarded == [("accept", "text/plain")]
+
+
+@pytest.mark.asyncio
+async def test_proxy_auth_rejects_unknown_bearer_token(monkeypatch):
+    from gpustack.api.auth import authenticate_proxy_request_headers
+
+    _proxy_token_config(monkeypatch)
+    _proxy_api_key_lookup(monkeypatch, None)
+
+    assert not await authenticate_proxy_request_headers(
+        {"Proxy-Authorization": "Bearer not-the-gateway-token"}
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"Proxy-Authorization": "Basic dXNlcjpwYXNz"},
+        {"Authorization": ""},
+    ],
+)
+async def test_proxy_auth_rejects_missing_or_non_bearer_credentials(
+    monkeypatch, headers
+):
+    from gpustack.api.auth import authenticate_proxy_request_headers
+
+    _proxy_token_config(monkeypatch)
+    lookup = AsyncMock(return_value=object())
+    monkeypatch.setattr(
+        "gpustack.api.auth.authenticate_worker_by_request_headers", lookup
+    )
+
+    assert not await authenticate_proxy_request_headers(headers)
+    lookup.assert_not_awaited()
