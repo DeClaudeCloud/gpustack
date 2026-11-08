@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from gpustack.client.generated_model_instance_client import ModelInstanceClient
+from gpustack.client.model_instance_client import ModelInstanceClient
 from gpustack.schemas.models import (
     DistributedServers,
     ModelConfigSnapshot,
@@ -73,7 +73,12 @@ def test_unrelated_updates_do_not_supply_configuration_snapshot(
             "manager": ServeManager,
             "metrics": RuntimeMetricsAggregator,
         }[writer]
-        cls._update_model_instance(owner, 11, state=ModelInstanceStateEnum.RUNNING)
+        kwargs = (
+            {"expected_instance": owner._model_instance} if writer == "metrics" else {}
+        )
+        cls._update_model_instance(
+            owner, 11, state=ModelInstanceStateEnum.RUNNING, **kwargs
+        )
 
     http_client.put.assert_called_once()
     payload = json.loads(http_client.put.call_args.kwargs["content"])
@@ -94,3 +99,80 @@ def test_explicit_startup_update_includes_configuration_snapshot():
     assert (
         ModelConfigSnapshot.model_validate(payload["model_config_snapshot"]) == snapshot
     )
+
+
+def test_managed_startup_snapshot_uses_the_generation_fenced_report():
+    from gpustack.schemas.models import ModelInstanceMemberReport
+
+    owner, http_client = _client(None)
+    owner._worker.id = 1
+    owner._model_instance.distributed_servers.workloads = []
+    owner._model_instance.distributed_servers.orchestration_mode = "managed"
+    snapshot = ModelConfigSnapshot(
+        backend_parameters=['--current'], env={'MODE': 'test'}
+    )
+    InferenceServer._update_model_instance(owner, 11, model_config_snapshot=snapshot)
+    payload = json.loads(http_client.put.call_args.kwargs['content'])
+    report = ModelInstanceMemberReport.model_validate(payload)
+    assert report.restart_count == 0
+    assert report.workloads is None
+    assert report.observations is None
+    assert report.model_config_snapshot == snapshot
+    assert 'distributed_servers' not in payload
+
+
+@pytest.mark.parametrize('group_recovery', [False, True])
+@pytest.mark.parametrize('matching', [False, True])
+def test_legacy_launch_checks_actual_configuration_against_server_policy(
+    group_recovery, matching
+):
+    from gpustack.schemas.models import BackendEnum, DistributedServerCoordinateModeEnum
+    from tests.utils.model import new_model
+
+    owner, _ = _client(None)
+    instance = owner._model_instance
+    instance.backend = BackendEnum.VLLM
+    instance.distributed_servers.mode = (
+        DistributedServerCoordinateModeEnum.INITIALIZE_LATER
+    )
+    instance.distributed_servers.group_recovery = group_recovery
+    config_is_elastic = group_recovery != matching
+    model = new_model(
+        1,
+        'model',
+        huggingface_repo_id='org/repo',
+        backend_parameters=['--enable-elastic-ep'] if config_is_elastic else [],
+    )
+    owner._clientset.models = SimpleNamespace(get=MagicMock(return_value=model))
+    owner._config = SimpleNamespace(data_dir='/worker')
+    if matching:
+        InferenceServer.get_model(owner)
+        assert (
+            owner._model_config_snapshot.backend_parameters == model.backend_parameters
+        )
+    else:
+        with pytest.raises(RuntimeError, match='differs from recovery policy'):
+            InferenceServer.get_model(owner)
+        assert not hasattr(owner, '_model_config_snapshot')
+    owner._clientset.model_instances.get.assert_called_once_with(id=11, use_cache=False)
+
+
+@pytest.mark.parametrize('policy', [False, True])
+def test_starting_watch_preserves_the_confirmed_round_policy(policy):
+    from gpustack.schemas.models import BackendEnum, DistributedServerCoordinateModeEnum
+    from gpustack.server.bus import Event, EventType
+
+    owner, _ = _client(None)
+    instance = owner._model_instance
+    instance.backend = BackendEnum.VLLM
+    instance.distributed_servers.mode = (
+        DistributedServerCoordinateModeEnum.INITIALIZE_LATER
+    )
+    instance.distributed_servers.group_recovery = policy
+    data = instance.model_dump()
+    data['distributed_servers']['group_recovery'] = None
+    data.update(state=ModelInstanceStateEnum.STARTING, resolved_path='/model')
+    assert InferenceServer._stop_when_starting(
+        owner, Event(type=EventType.UPDATED, data=data)
+    )
+    assert owner._model_instance.distributed_servers.group_recovery is policy
