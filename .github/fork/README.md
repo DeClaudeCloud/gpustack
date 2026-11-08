@@ -32,6 +32,16 @@ The approval records a reviewed change; it does not generate or execute repair
 SQL. Future edits to the same bundle produce another fingerprint and need
 another pending repair revision.
 
+The v2.3.1 instance lookup index repair is revision `e61f4c2a9b70`, after
+the fork merge `c30524955077`. It adds missing `cluster_id` and `model_id`
+indexes on `model_instances` for databases that already applied the bundle.
+Existing indexes with the lookup column first are preserved, including
+composite foreign-key indexes on MySQL/OceanBase. Downgrading the repair keeps
+these bundle-owned indexes; the v2.3.1 bundle handles their removal.
+
+Migration regression checks exercise upgrades and inspect the resulting schema,
+rather than assuming a fixed number of revisions between a release and `head`.
+
 ## Image gate
 
 The image workflow pins the previous `:dev` digest, builds and loads a local

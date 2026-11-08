@@ -4,6 +4,11 @@
     "repair_revision": "82f0e1b6a943",
     "reason": "Add deployment revision history for existing dev databases."
   },
+  "c8d3e6f1a902": {
+    "fingerprint": "75f30ace486efa022b7d4fb06bf0e50bb923f0867bd740fe27bfc0dab372c2d0",
+    "repair_revision": "e61f4c2a9b70",
+    "reason": "Add instance membership lookup indexes for databases that already applied v2.3.1; preserve existing supporting foreign-key indexes."
+  },
   "d5e8f0a1b2c3": {
     "fingerprint": "ebe39266bb5ebb15c5f96d36233a584413a09f8511054090e705dd9fcb080046",
     "repair_revision": "82f0e1b6a943",

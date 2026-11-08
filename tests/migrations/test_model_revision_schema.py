@@ -219,20 +219,79 @@ def test_lookup_index_downgrade_preserves_required_mysql_fk_index(
     assert migration.op.drop_index.call_count == (0 if dialect == 'mysql' else 2)
 
 
-def test_v231_indexes_run_for_databases_already_at_v230():
+@pytest.fixture
+def migration_database(tmp_path):
     from alembic.config import Config
-    from alembic.script import ScriptDirectory
 
+    (tmp_path / "env.py").write_text(
+        "from alembic import context\n"
+        "connection = context.config.attributes['connection']\n"
+        "context.configure(connection=connection)\n"
+        "with context.begin_transaction():\n"
+        "    context.run_migrations()\n"
+    )
     cfg = Config()
+    cfg.set_main_option("script_location", str(tmp_path))
     cfg.set_main_option(
-        "script_location",
-        str(Path(__file__).resolve().parents[2] / "gpustack/migrations"),
+        "version_locations",
+        str(Path(__file__).resolve().parents[2] / "gpustack/migrations/versions"),
     )
-    scripts = ScriptDirectory.from_config(cfg)
-    pending = list(
-        scripts.iterate_revisions(scripts.get_current_head(), "a7e2c9d4f681")
-    )
-    assert [step.revision for step in pending] == ["c8d3e6f1a902"]
+    engine = sa.create_engine("sqlite://")
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                "CREATE TABLE model_instances "
+                "(id INTEGER PRIMARY KEY, cluster_id INTEGER, model_id INTEGER)"
+            )
+        )
+        connection.execute(sa.text("INSERT INTO model_instances VALUES (1, 2, 3)"))
+        cfg.attributes["connection"] = connection
+        yield cfg, connection
+    engine.dispose()
+
+
+def test_v231_upgrade_adds_snapshot_and_lookup_indexes(migration_database):
+    from alembic import command
+
+    cfg, connection = migration_database
+    command.stamp(cfg, "a7e2c9d4f681")
+    command.upgrade(cfg, "c8d3e6f1a902")
+    inspector = sa.inspect(connection)
+    assert "model_config_snapshot" in {
+        column["name"] for column in inspector.get_columns("model_instances")
+    }
+    assert {
+        tuple(index["column_names"])
+        for index in inspector.get_indexes("model_instances")
+    } == {("cluster_id",), ("model_id",)}
+
+
+@pytest.mark.parametrize("existing", [(), ("cluster_id",), ("cluster_id", "model_id")])
+def test_lookup_index_repair_preserves_existing_database(migration_database, existing):
+    from alembic import command
+
+    cfg, connection = migration_database
+    for field in existing:
+        connection.execute(
+            sa.text(f"CREATE INDEX existing_{field} ON model_instances ({field}, id)")
+        )
+    command.stamp(cfg, "c30524955077")
+    command.upgrade(cfg, "head")
+    indexes = sa.inspect(connection).get_indexes("model_instances")
+    expected = {}
+    for field in ("cluster_id", "model_id"):
+        name = (
+            f"existing_{field}" if field in existing else f"ix_model_instances_{field}"
+        )
+        expected[name] = [field, "id"] if field in existing else [field]
+    assert {index["name"]: index["column_names"] for index in indexes} == expected
+    assert connection.execute(sa.text("SELECT * FROM model_instances")).all() == [
+        (1, 2, 3)
+    ]
+    command.downgrade(cfg, "c30524955077")
+    assert sa.inspect(connection).get_indexes("model_instances") == indexes
+    command.upgrade(cfg, "head")
+    assert sa.inspect(connection).get_indexes("model_instances") == indexes
 
 
 def test_v231_bundle_applies_snapshot_and_lookup_indexes(lookup_migration, monkeypatch):
